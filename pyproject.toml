@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fraud-detection-system"
+version = "0.1.0"
+description = "Real-time fraud detection with Kafka, Spark Structured Streaming, and Streamlit."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "python-dotenv>=1.0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
