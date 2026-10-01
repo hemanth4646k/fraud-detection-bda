@@ -5,12 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fraud-detection-system"
 version = "0.1.0"
-description = "Real-time fraud detection with Kafka, Spark Structured Streaming, and Streamlit."
+description = "End-to-end real-time fraud detection with Kafka, Spark Structured Streaming, and Streamlit."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "boto3>=1.35.0",
+  "kafka-python>=2.0.2",
+  "numpy>=1.26.0",
+  "pandas>=2.2.0",
+  "pyarrow>=16.1.0,<17.0.0",
+  "pyspark==3.5.1",
   "python-dotenv>=1.0.1",
+  "scikit-learn>=1.5.0",
+  "snowflake-connector-python[pandas]>=3.10.1",
+  "streamlit>=1.41.0",
 ]
+
+[project.scripts]
+fraud-download = "fraud_detection.download:main"
+fraud-train    = "fraud_detection.train:main"
+fraud-produce  = "fraud_detection.producer:main"
+fraud-stream   = "fraud_detection.streaming:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
