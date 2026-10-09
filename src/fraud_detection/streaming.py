@@ -36,3 +36,32 @@ def build_spark_session(settings) -> SparkSession:
     spark.sparkContext.setLogLevel("WARN")
     spark.conf.set("spark.sql.shuffle.partitions", str(settings.spark_shuffle_partitions))
     return spark
+
+from pyspark.sql import functions as F
+from .scoring import score_transaction
+
+
+def build_score_udf(spark: SparkSession, artifact: dict):
+    broadcast_artifact = spark.sparkContext.broadcast(artifact)
+    output_schema = T.StructType([
+        T.StructField("risk_score", T.DoubleType(), False),
+        T.StructField("predicted_label", T.IntegerType(), False),
+    ])
+
+    def _score(payload):
+        if payload is None:
+            return 0.0, 0
+        record = payload.asDict(recursive=True) if hasattr(payload, "asDict") else dict(payload)
+        probability, predicted_label = score_transaction(record, broadcast_artifact.value)
+        return float(probability), int(predicted_label)
+
+    return F.udf(_score, output_schema)
+
+
+def alert_level_expression(min_alert_probability: float):
+    return (
+        F.when(F.col("risk_score") >= 0.95, F.lit("critical"))
+        .when(F.col("risk_score") >= 0.85, F.lit("high"))
+        .when(F.col("risk_score") >= float(min_alert_probability), F.lit("medium"))
+        .otherwise(F.lit("monitor"))
+    )
