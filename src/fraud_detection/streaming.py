@@ -1,12 +1,16 @@
 import os
 import sys
+import time
 
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
-from pyspark.sql import SparkSession, types as T
+from pyspark.sql import SparkSession, functions as F, types as T
 
+from .config import get_settings
+from .kafka_utils import ensure_topic
 from .schema import ANON_FEATURES
+from .scoring import load_model_artifact, score_transaction
 
 
 def build_transaction_schema() -> T.StructType:
@@ -37,9 +41,6 @@ def build_spark_session(settings) -> SparkSession:
     spark.conf.set("spark.sql.shuffle.partitions", str(settings.spark_shuffle_partitions))
     return spark
 
-from pyspark.sql import functions as F
-from .scoring import score_transaction
-
 
 def build_score_udf(spark: SparkSession, artifact: dict):
     broadcast_artifact = spark.sparkContext.broadcast(artifact)
@@ -65,3 +66,89 @@ def alert_level_expression(min_alert_probability: float):
         .when(F.col("risk_score") >= float(min_alert_probability), F.lit("medium"))
         .otherwise(F.lit("monitor"))
     )
+
+
+def main() -> None:
+    settings = get_settings()
+    settings.ensure_local_dirs()
+
+    artifact = load_model_artifact(settings.model_artifact_path)
+    if settings.model_threshold_override is not None:
+        artifact["threshold"] = float(settings.model_threshold_override)
+
+    bootstrap_servers = [s.strip() for s in settings.kafka_bootstrap_servers.split(",")]
+    ensure_topic(bootstrap_servers, settings.kafka_topic)
+
+    spark = build_spark_session(settings)
+    score_udf = build_score_udf(spark, artifact)
+
+    kafka_stream = (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", settings.kafka_bootstrap_servers)
+        .option("subscribe", settings.kafka_topic)
+        .option("startingOffsets", "latest")
+        .option("failOnDataLoss", "false")
+        .load()
+    )
+
+    parsed_stream = (
+        kafka_stream.select(
+            F.from_json(F.col("value").cast("string"), build_transaction_schema()).alias("payload")
+        )
+        .select("payload.*")
+        .dropna(subset=["transaction_id"])
+    )
+
+    payload_columns = [F.col(col) for col in parsed_stream.columns]
+    scored_stream = (
+        parsed_stream.withColumn("model_output", score_udf(F.struct(*payload_columns)))
+        .withColumn("risk_score", F.col("model_output.risk_score"))
+        .withColumn("predicted_label", F.col("model_output.predicted_label"))
+        .drop("model_output")
+        .withColumn("processed_at", F.current_timestamp())
+        .withColumn("model_threshold", F.lit(float(artifact["threshold"])))
+        .withColumn("alert_level", alert_level_expression(settings.min_alert_probability))
+    )
+
+    alerts_stream = scored_stream.filter(
+        (F.col("predicted_label") == 1) | (F.col("risk_score") >= float(settings.min_alert_probability))
+    )
+
+    queries = [
+        scored_stream.writeStream.format("parquet")
+        .outputMode("append")
+        .option("path", str(settings.predictions_dir))
+        .option("checkpointLocation", str(settings.checkpoint_dir / "predictions"))
+        .start(),
+        alerts_stream.writeStream.format("parquet")
+        .outputMode("append")
+        .option("path", str(settings.alerts_dir))
+        .option("checkpointLocation", str(settings.checkpoint_dir / "alerts"))
+        .start(),
+    ]
+
+    print(
+        f"Spark fraud scorer running | topic={settings.kafka_topic} "
+        f"| local sink={settings.predictions_dir}"
+    )
+
+    try:
+        while True:
+            inactive = [q for q in queries if not q.isActive]
+            if inactive:
+                exc = inactive[0].exception()
+                if exc is not None:
+                    raise RuntimeError(f"Streaming query failed: {exc}")
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("Stopping streaming queries...")
+        for q in queries:
+            if q.isActive:
+                q.stop()
+    finally:
+        spark.stop()
+
+
+if __name__ == "__main__":
+    main()
