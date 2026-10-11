@@ -11,6 +11,7 @@ from .config import get_settings
 from .kafka_utils import ensure_topic
 from .schema import ANON_FEATURES
 from .scoring import load_model_artifact, score_transaction
+from .storage import export_alerts_batch, export_predictions_batch
 
 
 def build_transaction_schema() -> T.StructType:
@@ -44,10 +45,12 @@ def build_spark_session(settings) -> SparkSession:
 
 def build_score_udf(spark: SparkSession, artifact: dict):
     broadcast_artifact = spark.sparkContext.broadcast(artifact)
-    output_schema = T.StructType([
-        T.StructField("risk_score", T.DoubleType(), False),
-        T.StructField("predicted_label", T.IntegerType(), False),
-    ])
+    output_schema = T.StructType(
+        [
+            T.StructField("risk_score", T.DoubleType(), False),
+            T.StructField("predicted_label", T.IntegerType(), False),
+        ]
+    )
 
     def _score(payload):
         if payload is None:
@@ -76,7 +79,7 @@ def main() -> None:
     if settings.model_threshold_override is not None:
         artifact["threshold"] = float(settings.model_threshold_override)
 
-    bootstrap_servers = [s.strip() for s in settings.kafka_bootstrap_servers.split(",")]
+    bootstrap_servers = [item.strip() for item in settings.kafka_bootstrap_servers.split(",")]
     ensure_topic(bootstrap_servers, settings.kafka_topic)
 
     spark = build_spark_session(settings)
@@ -99,7 +102,7 @@ def main() -> None:
         .dropna(subset=["transaction_id"])
     )
 
-    payload_columns = [F.col(col) for col in parsed_stream.columns]
+    payload_columns = [F.col(column) for column in parsed_stream.columns]
     scored_stream = (
         parsed_stream.withColumn("model_output", score_udf(F.struct(*payload_columns)))
         .withColumn("risk_score", F.col("model_output.risk_score"))
@@ -111,7 +114,8 @@ def main() -> None:
     )
 
     alerts_stream = scored_stream.filter(
-        (F.col("predicted_label") == 1) | (F.col("risk_score") >= float(settings.min_alert_probability))
+        (F.col("predicted_label") == 1)
+        | (F.col("risk_score") >= float(settings.min_alert_probability))
     )
 
     queries = [
@@ -127,25 +131,46 @@ def main() -> None:
         .start(),
     ]
 
+    if settings.s3_enabled or settings.snowflake_enabled:
+        queries.append(
+            scored_stream.writeStream.foreachBatch(
+                lambda batch_frame, batch_id: export_predictions_batch(batch_frame, batch_id, settings)
+            )
+            .outputMode("append")
+            .option("checkpointLocation", str(settings.checkpoint_dir / "predictions_export"))
+            .start()
+        )
+
+    if settings.s3_enabled:
+        queries.append(
+            alerts_stream.writeStream.foreachBatch(
+                lambda batch_frame, batch_id: export_alerts_batch(batch_frame, batch_id, settings)
+            )
+            .outputMode("append")
+            .option("checkpointLocation", str(settings.checkpoint_dir / "alerts_export"))
+            .start()
+        )
+
     print(
-        f"Spark fraud scorer running | topic={settings.kafka_topic} "
-        f"| local sink={settings.predictions_dir}"
+        f"Spark fraud scorer running with topic={settings.kafka_topic}, "
+        f"local sink={settings.predictions_dir}, alert sink={settings.alerts_dir}"
     )
 
     try:
         while True:
-            inactive = [q for q in queries if not q.isActive]
-            if inactive:
-                exc = inactive[0].exception()
-                if exc is not None:
-                    raise RuntimeError(f"Streaming query failed: {exc}")
+            inactive_queries = [query for query in queries if not query.isActive]
+            if inactive_queries:
+                failed_query = inactive_queries[0]
+                exception = failed_query.exception()
+                if exception is not None:
+                    raise RuntimeError(f"Streaming query failed: {exception}")
                 break
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("Stopping streaming queries...")
-        for q in queries:
-            if q.isActive:
-                q.stop()
+        for query in queries:
+            if query.isActive:
+                query.stop()
     finally:
         spark.stop()
 
