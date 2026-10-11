@@ -13,31 +13,37 @@ flowchart TD
     C --> G
     G --> H["data/outputs/predictions"]
     G --> I["data/outputs/alerts"]
-    G --> J["MinIO bucket (in progress)"]
-    G --> K["Snowflake (planned)"]
-    H --> L["dashboard/app.py (in progress)"]
+    G --> J["MinIO bucket"]
+    G --> K["Snowflake (optional)"]
+    H --> L["dashboard/app.py"]
     I --> L
 ```
 
 ## Runtime Stages
 
 ### Offline training
+
 - Download the fraud dataset.
-- Split into train, validation, and holdout test sets.
-- Engineer numeric features for both offline and real-time scoring.
+- Split the data into train, validation, and holdout test sets.
+- Engineer numeric features suitable for both offline and real-time scoring.
 - Train a class-weighted logistic regression model.
-- Tune decision threshold on validation set using F-beta bias toward recall.
-- Persist coefficients, scaling metadata, and threshold as JSON artifact.
+- Tune a decision threshold on the validation set using an F-beta bias toward recall.
+- Persist the model coefficients, scaling metadata, and threshold in JSON.
 
 ### Online scoring
+
 - Replay holdout transactions through Kafka.
-- Spark Structured Streaming consumes transactions in micro-batches.
-- Same feature engineering logic applied as during training.
-- Score each row with logistic function from JSON artifact.
-- Write scored transactions and high-risk alerts as parquet micro-batches.
+- Use Spark Structured Streaming to consume transactions in micro-batches.
+- Apply the exact same feature engineering logic used during training.
+- Score each row with a logistic function using the JSON artifact.
+- Write scored transactions and high-risk alerts as parquet.
+- Export each micro-batch to MinIO and optionally to Snowflake.
 
 ## Production-Friendly Details
-- No pickled model in streaming — JSON artifact only.
-- Clear separation: training → replay → scoring → storage → dashboard.
-- Fraud oversampling isolated to producer, not the model itself.
-- Snowflake and S3 sinks are optional (in progress).
+
+- No pickled model dependency in streaming.
+- Clear separation between training, replay, scoring, storage, and dashboard layers.
+- Fraud oversampling is isolated to the replay producer, not the model itself.
+- Object storage export is independent from dashboard serving.
+- Snowflake is optional so the project runs locally without cloud credentials.
+
