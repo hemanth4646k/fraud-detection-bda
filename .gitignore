@@ -12,7 +12,8 @@ dist/
 .idea/
 .pytest_cache/
 .coverage
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
